@@ -1,0 +1,16 @@
+# Virtual environment and build artefacts
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Local traces and outputs (live in APITRACE_MCP_TRACE_DIR, not the repo)
+*.trace
+*.rdc
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
