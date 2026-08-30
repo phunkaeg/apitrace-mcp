@@ -303,6 +303,32 @@ class ApiDetectionTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 server._api_of(Path("mystery.trace"))
 
+    def test_directx_label_selects_the_d3d_retracer(self) -> None:
+        # apitrace labels every Direct3D flavour (DirectDraw, D3D8, D3D9, DXGI)
+        # simply "DirectX". Not mapping that broke dump_state / dump_images /
+        # replay_trace for every D3D trace -- this server's primary target.
+        for label in ("DirectX", "directx", "D3D9", "Direct3D 9", "DXGI"):
+            with (
+                patch.object(server.ENV, "any_root", return_value=object()),
+                patch.object(
+                    server.analysis, "trace_info", return_value={"API": label}
+                ),
+            ):
+                self.assertEqual(
+                    server._api_of(Path("game.trace")), "d3d", f"label {label!r}"
+                )
+
+    def test_opengl_label_still_selects_the_gl_retracer(self) -> None:
+        with (
+            patch.object(server.ENV, "any_root", return_value=object()),
+            patch.object(
+                server.analysis,
+                "trace_info",
+                return_value={"API": "OpenGL + GLX/WGL/CGL"},
+            ),
+        ):
+            self.assertEqual(server._api_of(Path("game.trace")), "gl")
+
     def test_d3d12_target_does_not_recommend_dxgi_wrapper(self) -> None:
         pe = SimpleNamespace(
             bits=64,

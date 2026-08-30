@@ -1177,7 +1177,17 @@ def _api_of(trace: Path) -> str:
         return "gl"
     if "d3d12" in low or "direct3d 12" in low or "vulkan" in low:
         raise RuntimeError(f"trace API is not supported by apitrace replay: {api!r}")
-    if "d3d" in low or "direct3d" in low or "directdraw" in low or "dxgi" in low:
+    # apitrace reports every Direct3D flavour -- DirectDraw, D3D8, D3D9, DXGI --
+    # under the single label "DirectX", so the bare word has to map to
+    # d3dretrace. Without it every D3D trace, the whole point of this server,
+    # failed retracer selection outright.
+    if (
+        low == "directx"
+        or "d3d" in low
+        or "direct3d" in low
+        or "directdraw" in low
+        or "dxgi" in low
+    ):
         return "d3d"
     raise RuntimeError(f"could not determine retracer from apitrace API metadata: {api!r}")
 

@@ -554,3 +554,61 @@ class RealTraceRegressionTests(unittest.TestCase):
         single = analysis.MatrixSlot(source="vs_c[0..3]", function="SetVertexShaderConstantF")
         single.kinds.update({"projection": 4})
         self.assertNotIn("kind_breakdown", single.to_dict(include_matrix=False))
+
+    def test_track_camera_follows_the_write_that_moves(self) -> None:
+        # A per-draw world*view*projection slot: several writes per frame, each
+        # a different object. On a real SWAT 4 capture the write at a fixed
+        # ordinal was a static HUD quad, so sampling one position per frame
+        # reported "camera is static" while the player was walking.
+        calls = []
+        no = 0
+        for frame in range(4):
+            # Write 0: never moves (the HUD/skybox trap).
+            calls.append(
+                call(no, "IDirect3DDevice9::SetVertexShaderConstantF",
+                     [("StartRegister", 0), ("pConstantData", view_matrix((9.0, 9.0, 9.0))),
+                      ("Vector4fCount", 4)]))
+            no += 1
+            # Write 1: travels a unit per frame.
+            calls.append(
+                call(no, "IDirect3DDevice9::SetVertexShaderConstantF",
+                     [("StartRegister", 0),
+                      ("pConstantData", view_matrix((float(frame), 0.0, 0.0))),
+                      ("Vector4fCount", 4)]))
+            no += 1
+            calls.append(call(no, "IDirect3DDevice9::Present", flags=CALL_FLAG_END_FRAME))
+            no += 1
+
+        with patch.object(analysis, "iter_calls", side_effect=lambda *a, **k: iter(calls)):
+            result = analysis.track_camera(
+                None, "dummy.trace", source="vs_c[0..3]", max_frames=10
+            )
+
+        self.assertTrue(result["camera_moves"], "motion in a later write was missed")
+        self.assertEqual(result["sample_ordinal"], 1, "did not follow the moving write")
+        self.assertEqual(result["writes_per_frame"], 2.0)
+        self.assertIn("per-draw", result["multi_write_note"])
+        self.assertGreater(result["eye_path_length"], 2.0)
+        self.assertEqual([f["eye"][0] for f in result["frames"]], [0.0, 1.0, 2.0, 3.0])
+
+    def test_track_camera_single_write_slot_stays_simple(self) -> None:
+        # A dedicated camera constant written once per frame must not grow the
+        # multi-write reporting.
+        calls = []
+        no = 0
+        for frame in range(3):
+            calls.append(
+                call(no, "IDirect3DDevice9::SetVertexShaderConstantF",
+                     [("StartRegister", 0),
+                      ("pConstantData", view_matrix((float(frame), 0.0, 0.0))),
+                      ("Vector4fCount", 4)]))
+            no += 1
+            calls.append(call(no, "IDirect3DDevice9::Present", flags=CALL_FLAG_END_FRAME))
+            no += 1
+        with patch.object(analysis, "iter_calls", side_effect=lambda *a, **k: iter(calls)):
+            result = analysis.track_camera(
+                None, "dummy.trace", source="vs_c[0..3]", max_frames=10
+            )
+        self.assertTrue(result["camera_moves"])
+        self.assertNotIn("multi_write_note", result)
+        self.assertNotIn("writes_per_frame", result)

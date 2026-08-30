@@ -14,6 +14,7 @@ into a 4 GB reply.
 from __future__ import annotations
 
 import json
+import math
 import re
 import struct
 from collections import Counter
@@ -115,6 +116,12 @@ MAX_BLOB_EYE_DISTANCE = 100_000.0
 MAX_GL_MATRIX_STATES = 1024
 MAX_GL_CONTEXT_BINDINGS = 4096
 MAX_GL_MATRIX_STACK_DEPTH = 256
+
+# How many writes of one slot to keep per frame while tracking a camera. A slot
+# written once per frame is a dedicated camera constant; one written dozens of
+# times is a per-draw world*view*projection, and which write you sample decides
+# whether you see the camera or a static HUD quad.
+MAX_TRACK_SAMPLES_PER_FRAME = 16
 
 
 def matches(name: str, needles: Iterable[str]) -> bool:
@@ -1251,6 +1258,20 @@ def _first_int(call: Call, names: tuple[str, ...]) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+def _eye_path_length(entries: list[dict]) -> float:
+    """Total distance the eye travels along a series of tracked samples."""
+    total = 0.0
+    previous: list[float] | None = None
+    for entry in entries:
+        eye = entry.get("eye")
+        if eye is None:
+            continue
+        if previous is not None:
+            total += math.dist(eye, previous)
+        previous = eye
+    return total
+
+
 def track_camera(
     root: ApitraceRoot,
     trace: str | Path,
@@ -1307,17 +1328,18 @@ def track_camera(
     frame = 0
     extractor = _MatrixEventExtractor(scan_constants=True, scan_buffers=True)
     target = chosen["source"]
-    pending: dict[str, Any] | None = None
+    frame_samples: list[list[dict]] = []
+    current: list[dict] = []
 
     def finish_frame() -> bool:
-        nonlocal pending
+        nonlocal current
         if max_frames <= 0:
-            pending = None
+            current = []
             return True
-        if pending is not None:
-            track.append(pending)
-            pending = None
-        return len(track) >= max(0, max_frames)
+        if current:
+            frame_samples.append(current)
+            current = []
+        return len(frame_samples) >= max(0, max_frames)
 
     for call in iter_calls(root, trace, calls=calls, limit=limit):
         if call.is_frame_end:
@@ -1347,10 +1369,35 @@ def track_camera(
                 entry["fov_y_deg"] = decode.fov_y_deg
             if event.parameters:
                 entry["parameters"] = event.parameters
-            pending = entry
+            if len(current) < MAX_TRACK_SAMPLES_PER_FRAME:
+                current.append(entry)
 
-    if len(track) < max(0, max_frames):
+    if len(frame_samples) < max(0, max_frames):
         finish_frame()
+
+    # Pick which write of the frame to follow.
+    #
+    # Sampling a fixed position (the first or last write) is only right when the
+    # slot holds a dedicated camera constant. For a per-draw world*view*
+    # projection -- the common case in D3D9 engines -- the writes are different
+    # objects, and the one that happens to sit at a fixed ordinal is often a
+    # skybox or HUD quad that never moves. That produced a false "camera is
+    # static" on a real SWAT 4 capture where the player was walking. Following
+    # the write whose eye travels furthest reports motion when any of them moved.
+    widths = [len(entries) for entries in frame_samples]
+    max_width = max(widths, default=0)
+    sample_ordinal = 0
+    best_distance = -1.0
+    for ordinal in range(max_width):
+        series = [entries[ordinal] for entries in frame_samples if len(entries) > ordinal]
+        distance = _eye_path_length(series)
+        if distance > best_distance:
+            best_distance, sample_ordinal = distance, ordinal
+    track = [
+        entries[sample_ordinal]
+        for entries in frame_samples
+        if len(entries) > sample_ordinal
+    ]
 
     result: dict[str, Any] = {
         "slot": chosen["source"],
@@ -1369,6 +1416,17 @@ def track_camera(
             "source": proj_slot["source"],
             "samples": proj_slot["samples"],
         }
+    if max_width > 1:
+        result["writes_per_frame"] = round(sum(widths) / len(widths), 1) if widths else 0
+        result["sample_ordinal"] = sample_ordinal
+        result["multi_write_note"] = (
+            f"this slot is written ~{result['writes_per_frame']} times per frame, so it "
+            "is a per-draw world*view*projection rather than a dedicated camera "
+            "constant; each write expresses the eye in that object's space. The "
+            f"trajectory follows write #{sample_ordinal}, the one whose eye travels "
+            "furthest -- other writes track other objects."
+        )
+
     eye_track = [entry for entry in track if "eye" in entry]
     if len(eye_track) >= 2:
         moved = any(
@@ -1376,10 +1434,15 @@ def track_camera(
             for entry in eye_track[1:]
         )
         result["camera_moves"] = moved
+        result["eye_path_length"] = round(_eye_path_length(track), 4)
         if not moved:
             result["note"] = (
-                "eye is static across the captured frames -- either the player did not "
-                "move during capture, or this slot is a model matrix rather than the view"
+                "eye is static across every write of this slot -- either nothing moved "
+                "during the capture, or this slot is a model matrix rather than the view"
+                if max_width > 1
+                else "eye is static across the captured frames -- either the player did "
+                "not move during capture, or this slot is a model matrix rather than "
+                "the view"
             )
     return result
 

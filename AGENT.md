@@ -80,7 +80,11 @@ Traces are large. Scope everything with `calls=`: `100-2000`, `0-1000/draw`, `0-
 | `ortho` | HUD/UI or shadow pass |
 
 Then `track_camera` to confirm: if the eye position changes when the player moved during capture,
-the slot is a strong view candidate. Moving models, lights, reflections, and shadow cameras can
+the slot is a strong view candidate. When a slot is written many times per frame it is a per-draw
+world*view*projection, not a camera constant: the result then carries `writes_per_frame`,
+`sample_ordinal` and `multi_write_note`, and the trajectory follows whichever write travels
+furthest. Do not read a single write's eye as the camera in that case — each expresses the eye in
+its own object's space. Moving models, lights, reflections, and shadow cameras can
 also move, so corroborate it with the explicit transform state/resource binding and scene timing.
 The tool reports `view_z_axis` plus left-/right-handed forward candidates because a rigid matrix
 alone does not prove handedness.
