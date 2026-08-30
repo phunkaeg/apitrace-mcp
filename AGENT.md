@@ -75,6 +75,7 @@ Traces are large. Scope everything with `calls=`: `100-2000`, `0-1000/draw`, `0-
 | `projection` | the game's FOV, near and far — read `fov_y_deg` |
 | `rigid` + `changes_per_frame` | camera candidate; confirm it with `track_camera` |
 | `viewproj` in `vs_c[8..11]` | the constant registers a VR patch rewrites |
+| `rigid` in a 3-register slot like `vs_c[9..11]` | a float4x3 view/world matrix — D3D9 engines upload these to save constant space |
 | `viewproj` at `glBufferData[target=GL_UNIFORM_BUFFER,buffer=N,...]+96` | resource-qualified bytes a VR patch may rewrite |
 | `ortho` | HUD/UI or shadow pass |
 
@@ -95,6 +96,16 @@ ReGenny read — and reports FOV, near/far, handedness and camera position.
   one (NDC -1..1) have identical layouts and differ only in how near/far decode. The convention
   is taken from the function name; where it cannot be, both readings are reported in
   `alt_near_far`. **FOV and aspect are unaffected** — those are always trustworthy.
+- **Constant windows are upload-aligned.** Candidate register windows are only
+  taken at whole-matrix offsets from the upload that wrote them, in 4-register
+  (float4x4) and 3-register (float4x3) sizes. Without that, one 144-register
+  bone-matrix upload yields ~140 overlapping pseudo-matrices. A consequence
+  worth knowing: a matrix written by a *partial* upload that starts mid-matrix
+  will not be enumerated at that offset.
+- **A slot can decode as more than one kind over a run.** When it does, the
+  result carries `kind_breakdown` alongside the majority `kind` — read the
+  per-sample `decode.kind`, not just the slot header. Slots are ranked by kind,
+  then decode confidence, then write count.
 - **Buffer scanning is heuristic.** Windows found inside `glBufferData`/`UpdateSubresource`/
   `memcpy` blobs must clear a higher bar (the w-column has to be a unit view direction), and
   vertex/index buffer targets are skipped entirely. Treat a lone buffer hit as a lead, not a

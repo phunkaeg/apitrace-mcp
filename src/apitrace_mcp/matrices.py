@@ -562,6 +562,12 @@ def _alt_reading_note(dec: MatrixDecode) -> str:
     )
 
 
+def _has_repeated_row(m: Sequence[float]) -> bool:
+    """True when two rows of the 4x4 are bit-identical (a sliding artefact)."""
+    rows = [tuple(m[r * 4 : r * 4 + 4]) for r in range(4)]
+    return len(set(rows)) < 4
+
+
 def classify(m16: Sequence[float], convention: str | None = None) -> MatrixDecode | None:
     """Best interpretation of 16 floats, trying both storage orders.
 
@@ -571,6 +577,13 @@ def classify(m16: Sequence[float], convention: str | None = None) -> MatrixDecod
     if len(m16) != 16 or not _finite(m16):
         return None
     if all(abs(v) < 1e-12 for v in m16):
+        return None
+    if _has_repeated_row(m16):
+        # No projection, rigid transform or world->clip matrix has two identical
+        # rows -- orthonormal rows cannot repeat, and a projection's rows differ
+        # by construction. What does produce them is a window slid along a block
+        # of packed matrices or vertex data, so this is a cheap, safe filter on
+        # the two scanning paths that enumerate windows.
         return None
 
     best: MatrixDecode | None = None

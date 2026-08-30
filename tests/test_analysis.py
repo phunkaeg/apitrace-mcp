@@ -483,3 +483,74 @@ class PickleParseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealTraceRegressionTests(unittest.TestCase):
+    """Defects found by running against a real UE3 / D3D9 capture (Dishonored).
+
+    The numbers here are taken verbatim from that trace: a float4x3 view matrix
+    in vs_c[6..8] and the projection scales in vs_c[0..3].
+    """
+
+    VIEW_4X3 = [
+        0.57944, 0.00590, 0.81439, 16.37790,
+        -0.06425, 0.99670, 0.03849, 2.61454,
+        -0.81187, -0.07467, 0.57819, 4.99379,
+    ]
+
+    def test_float4x3_upload_yields_a_view_matrix(self) -> None:
+        # D3D9 engines upload world/view matrices as three registers to save
+        # constant space. Scanning only 4-register windows missed these
+        # entirely -- on the real trace this slot did not exist at all.
+        bank = analysis._RegisterFile()
+        written = bank.write(6, list(self.VIEW_4X3))
+        self.assertEqual(written, (6, 8))
+        windows = {(base, size): flat for base, size, flat in bank.windows(*written)}
+        self.assertIn((6, 3), windows, "3-register window was not enumerated")
+
+        flat = windows[(6, 3)]
+        self.assertEqual(len(flat), 16)
+        self.assertEqual(flat[12:], [0.0, 0.0, 0.0, 1.0], "implicit last row")
+
+        decode = mx.classify(flat, "d3d")
+        self.assertIsNotNone(decode)
+        self.assertEqual(decode.kind, "rigid")
+        self.assertEqual(decode.layout, "transposed")
+        for actual, expected in zip(decode.eye, (-5.2677, -2.3297, -16.326)):
+            self.assertLess(abs(actual - expected), 1e-3)
+
+    def test_windows_are_upload_aligned(self) -> None:
+        # A 144-register bone-matrix upload used to yield ~140 overlapping
+        # candidates, nearly all of them straddling two real matrices.
+        bank = analysis._RegisterFile()
+        written = bank.write(6, [float(i) for i in range(12 * 4)])
+        bases = {(base, size) for base, size, _ in bank.windows(*written)}
+
+        # Aligned starts only, measured from the upload's own StartRegister.
+        self.assertIn((6, 4), bases)
+        self.assertIn((6, 3), bases)
+        self.assertIn((9, 3), bases)
+        self.assertIn((10, 4), bases)
+        for stray in ((7, 4), (8, 4), (7, 3), (8, 3), (11, 3)):
+            self.assertNotIn(stray, bases, f"unaligned window {stray} was emitted")
+
+    def test_repeated_rows_are_rejected(self) -> None:
+        # The signature of a window slid across packed matrices.
+        repeated = [
+            0.57944, 0.00590, 0.81439, 16.37790,
+            -0.06425, 0.99670, 0.03849, 2.61454,
+            -0.81187, -0.07467, 0.57819, 4.99379,
+            0.57944, 0.00590, 0.81439, 16.37790,
+        ]
+        self.assertIsNone(mx.classify(repeated, "d3d"))
+
+    def test_mixed_slot_reports_kind_breakdown(self) -> None:
+        slot = analysis.MatrixSlot(source="vs_c[9..11]", function="SetVertexShaderConstantF")
+        slot.kinds.update({"viewproj": 5, "rigid": 3})
+        data = slot.to_dict(include_matrix=False)
+        self.assertEqual(data["kind"], "viewproj")
+        self.assertEqual(data["kind_breakdown"], {"viewproj": 5, "rigid": 3})
+
+        single = analysis.MatrixSlot(source="vs_c[0..3]", function="SetVertexShaderConstantF")
+        single.kinds.update({"projection": 4})
+        self.assertNotIn("kind_breakdown", single.to_dict(include_matrix=False))

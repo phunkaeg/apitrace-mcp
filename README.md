@@ -21,7 +21,16 @@ understand an old renderer:
   and view-Z axis per frame. It reports both handedness-dependent forward-vector
   candidates, so the trace is not made to claim an orientation it cannot prove.
 - **Which register would a VR patch rewrite?** Matrix slots are reported as
-  register ranges — `vs_c[8..11]` — not just call numbers.
+  register ranges — `vs_c[8..11]` — not just call numbers. Both float4x4
+  (4-register) and float4x3 (3-register) uploads are recognised, and windows are
+  only taken at whole-matrix offsets from the upload that wrote them, so a large
+  packed bone-matrix block does not bury the camera in overlapping candidates.
+
+Validated against a real Direct3D 9 / Unreal Engine 3 capture: from a 786-frame
+Dishonored trace it recovers the float4x3 view matrix (world-space eye,
+cross-checked against the camera-position constant the engine uploads
+separately) and the projection scales giving 58.08° vertical / 89.25° horizontal
+FOV at 16:9.
 
 ## Why apitrace and not RenderDoc
 

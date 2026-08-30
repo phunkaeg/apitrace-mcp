@@ -353,6 +353,16 @@ class MatrixSlot:
             "source": self.source,
             "function": self.function,
             "kind": kind,
+            # One register range can decode differently over a run -- a view
+            # matrix reads as `rigid` while the camera is settled and as
+            # `viewproj` once something else is packed there. Reporting only the
+            # majority hides the more informative reading, so a mixed slot
+            # carries the full breakdown.
+            **(
+                {"kind_breakdown": dict(self.kinds.most_common())}
+                if len(self.kinds) > 1
+                else {}
+            ),
             "writes": self.hits,
             "distinct_values": len(self.distinct),
             "distinct_values_truncated": self.distinct_truncated,
@@ -382,6 +392,10 @@ class _RegisterFile:
 
     def __init__(self) -> None:
         self.regs: dict[int, tuple[float, float, float, float]] = {}
+        # Which upload last wrote each register. Matrices are packed from the
+        # start of an upload, so this is what tells a real matrix boundary from
+        # an arbitrary offset into somebody else's block.
+        self.origin: dict[int, int] = {}
 
     def write(self, start: int, floats: list[float]) -> tuple[int, int] | None:
         if start < 0 or start >= MAX_CONST_REGISTERS:
@@ -394,19 +408,42 @@ class _RegisterFile:
             chunk = floats[i * 4 : i * 4 + 4]
             if len(chunk) == 4:
                 self.regs[start + i] = (chunk[0], chunk[1], chunk[2], chunk[3])
+                self.origin[start + i] = start
         return start, start + count - 1
 
-    def windows(self, lo: int, hi: int) -> Iterable[tuple[int, list[float]]]:
-        """4-register windows overlapping [lo, hi]."""
-        start = max(0, lo - 3)
-        for base in range(start, hi + 1):
-            regs = [self.regs.get(base + k) for k in range(4)]
-            if any(r is None for r in regs):
-                continue
-            flat: list[float] = []
-            for r in regs:
-                flat.extend(r)  # type: ignore[arg-type]
-            yield base, flat
+    def windows(self, lo: int, hi: int) -> Iterable[tuple[int, int, list[float]]]:
+        """Matrix-shaped windows overlapping [lo, hi], as (base, size, 16 floats).
+
+        Two things keep this from drowning the caller in candidates, both learnt
+        from a real UE3 D3D9 trace where a single 144-register upload otherwise
+        produced ~140 overlapping "matrices":
+
+        * **Only upload-aligned windows.** Engines pack matrices contiguously
+          from the start of a constant upload, so a window straddling two of
+          them is an artefact of sliding rather than anything the game wrote.
+          Offsets are measured from the upload that set the window's first
+          register.
+        * **3-register windows as well as 4.** D3D9 engines commonly upload
+          world and view matrices as float4x3 to save constant space; the
+          implicit last row is (0, 0, 0, 1). Scanning only 4-register windows
+          misses those entirely *and* manufactures noise by pairing three real
+          rows with an unrelated fourth.
+        """
+        for size in (4, 3):
+            start = max(0, lo - (size - 1))
+            for base in range(start, hi + 1):
+                origin = self.origin.get(base)
+                if origin is None or (base - origin) % size:
+                    continue
+                regs = [self.regs.get(base + k) for k in range(size)]
+                if any(r is None for r in regs):
+                    continue
+                flat: list[float] = []
+                for r in regs:
+                    flat.extend(r)  # type: ignore[arg-type]
+                if size == 3:
+                    flat.extend((0.0, 0.0, 0.0, 1.0))
+                yield base, size, flat
 
 
 @dataclass
@@ -860,8 +897,12 @@ class _MatrixEventExtractor:
                 return events
             written = reg_file.write(int(start), floats)
             if written:
-                for base, flat in reg_file.windows(*written):
-                    events.append(_MatrixEvent(f"{bank}_c[{base}..{base + 3}]", name, flat))
+                for base, size, flat in reg_file.windows(*written):
+                    events.append(
+                        _MatrixEvent(
+                            f"{bank}_c[{base}..{base + size - 1}]", name, flat
+                        )
+                    )
             return events
 
         if self.scan_constants and matches(low, GL_PROGRAM_PARAM):
@@ -879,8 +920,12 @@ class _MatrixEventExtractor:
             reg_file = self.gl_param_files.setdefault(bank, _RegisterFile())
             written = reg_file.write(int(start), floats)
             if written:
-                for base, flat in reg_file.windows(*written):
-                    events.append(_MatrixEvent(f"{bank}_c[{base}..{base + 3}]", name, flat))
+                for base, size, flat in reg_file.windows(*written):
+                    events.append(
+                        _MatrixEvent(
+                            f"{bank}_c[{base}..{base + size - 1}]", name, flat
+                        )
+                    )
             return events
 
         return events
@@ -955,9 +1000,14 @@ def scan_matrices(
                 parameters=event.parameters,
             )
 
+    # Kind first (a projection tells you the FOV, so it leads), then how well
+    # the slot actually decoded, then how often it was written. Confidence has
+    # to outrank write count: on a real UE3 trace the correctly-decoded view
+    # matrix is written far less often than the per-object matrices sharing its
+    # register bank, and sorting by volume alone buries it.
     ranked = sorted(
         slots.values(),
-        key=lambda s: (_kind_rank(s), -s.hits),
+        key=lambda s: (_kind_rank(s), -_best_confidence(s), -s.hits),
     )
     return {
         "calls_scanned": scanned,
@@ -1137,6 +1187,14 @@ def record_frustum(
     slot.add(
         MatrixSample(call_no, frame, event.matrix, event.decode, event.parameters),
         max_samples=3,
+    )
+
+
+def _best_confidence(slot: MatrixSlot) -> float:
+    """Highest decode confidence among the samples kept for this slot."""
+    return max(
+        (s.decode.confidence for s in slot.samples if s.decode is not None),
+        default=0.0,
     )
 
 
