@@ -78,6 +78,7 @@ Traces are large. Scope everything with `calls=`: `100-2000`, `0-1000/draw`, `0-
 | `rigid` in a 3-register slot like `vs_c[9..11]` | a float4x3 view/world matrix — D3D9 engines upload these to save constant space |
 | `viewproj` at `glBufferData[target=GL_UNIFORM_BUFFER,buffer=N,...]+96` | resource-qualified bytes a VR patch may rewrite |
 | `ortho` | HUD/UI or shadow pass |
+| `SetTransform(D3DTS_PROJECTION)` | fixed-function engines (D3D8/D3D9) hand you FOV/near/far directly and decode at confidence 1.0 |
 
 Then `track_camera` to confirm: if the eye position changes when the player moved during capture,
 the slot is a strong view candidate. When a slot is written many times per frame it is a per-draw
@@ -88,6 +89,16 @@ its own object's space. Moving models, lights, reflections, and shadow cameras c
 also move, so corroborate it with the explicit transform state/resource binding and scene timing.
 The tool reports `view_z_axis` plus left-/right-handed forward candidates because a rigid matrix
 alone does not prove handedness.
+
+`camera_moves` requires *sustained* travel -- at least a quarter of frame transitions -- and the
+result carries `moving_transitions` / `frame_transitions` so you can judge it yourself. A single
+large jump between two otherwise-static values is a pass or mode switch, not a camera; the note
+says so. In a fixed-function engine the camera is often folded into `D3DTS_WORLD` rather than
+`D3DTS_VIEW`, so check both.
+
+**Find the gameplay before you analyse.** A capture is mostly menu far more often than you expect:
+a Morrowind trace ran 64 million calls of menu at ~11 draws/frame before ~440 draws/frame of actual
+world rendering. Probe `call_histogram` at a few offsets and follow the draws-per-frame.
 
 `decode_matrix` takes 16 pasted floats from anywhere — a Cheat Engine watch, a memory dump, a
 ReGenny read — and reports FOV, near/far, handedness and camera position.

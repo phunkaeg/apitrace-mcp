@@ -612,3 +612,47 @@ class RealTraceRegressionTests(unittest.TestCase):
         self.assertTrue(result["camera_moves"])
         self.assertNotIn("multi_write_note", result)
         self.assertNotIn("writes_per_frame", result)
+
+    def test_single_jump_is_not_reported_as_camera_motion(self) -> None:
+        # Morrowind's D3DTS_VIEW flips once between its UI and world pass and is
+        # otherwise identity. Treating "differs from frame 0" as motion reported
+        # that as a moving camera and sent the caller chasing a slot that can
+        # never yield a trajectory.
+        calls = []
+        no = 0
+        for frame in range(12):
+            eye = (0.0, 0.0, 600.0) if frame == 0 else (0.0, 0.0, 0.0)
+            calls.append(
+                call(no, "IDirect3DDevice8::SetTransform",
+                     [("State", "D3DTS_VIEW"), ("pMatrix", view_matrix(eye))]))
+            no += 1
+            calls.append(call(no, "IDirect3DDevice8::Present", flags=CALL_FLAG_END_FRAME))
+            no += 1
+        with patch.object(analysis, "iter_calls", side_effect=lambda *a, **k: iter(calls)):
+            result = analysis.track_camera(
+                None, "dummy.trace", source="SetTransform(D3DTS_VIEW)", max_frames=20
+            )
+        self.assertEqual(result["moving_transitions"], 1)
+        self.assertEqual(result["frame_transitions"], 11)
+        self.assertFalse(result["camera_moves"], "a single jump is not travel")
+        self.assertIn("pass or mode switch", result["note"])
+
+    def test_fixed_function_multi_write_note_is_not_called_a_worldviewproj(self) -> None:
+        calls = []
+        no = 0
+        for frame in range(4):
+            for k in range(3):  # same transform state set three times a frame
+                calls.append(
+                    call(no, "IDirect3DDevice8::SetTransform",
+                         [("State", "D3DTS_VIEW"),
+                          ("pMatrix", view_matrix((float(frame + k), 0.0, 0.0)))]))
+                no += 1
+            calls.append(call(no, "IDirect3DDevice8::Present", flags=CALL_FLAG_END_FRAME))
+            no += 1
+        with patch.object(analysis, "iter_calls", side_effect=lambda *a, **k: iter(calls)):
+            result = analysis.track_camera(
+                None, "dummy.trace", source="SetTransform(D3DTS_VIEW)", max_frames=10
+            )
+        note = result["multi_write_note"]
+        self.assertIn("separate render passes", note)
+        self.assertNotIn("per-draw world*view*projection", note)

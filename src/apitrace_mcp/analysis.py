@@ -170,12 +170,30 @@ def trace_info(root: ApitraceRoot, trace: str | Path, dump_frames: bool = False)
     if dump_frames:
         cmd.append("--dump-frames")
     cmd.append(str(trace))
-    stdout, stderr, _ = run(cmd, timeout=600, max_bytes=8_000_000)
+    stdout, stderr, truncated = run(cmd, timeout=600, max_bytes=8_000_000)
+    if truncated and dump_frames:
+        # A long capture can carry hundreds of thousands of frames, and the
+        # per-frame dump then exceeds the output budget and arrives cut off
+        # mid-structure. Parsing that fragment produced a bogus "unparseable
+        # JSON" error (seen on a 593k-frame, 7.4 GB Morrowind capture) which
+        # blamed apitrace for our own cap. Fall back to the small summary and
+        # say plainly that the frame list needs the paging tool instead.
+        summary = trace_info(root, trace, dump_frames=False)
+        summary["frames_omitted"] = (
+            "per-frame dump exceeded this tool's output budget for a trace with "
+            f"{summary.get('FramesCount', 'many')} frames; use list_frames, which "
+            "pages, or scope with an explicit call range"
+        )
+        return summary
     try:
         return _loads_lenient(stdout)
     except json.JSONDecodeError as exc:
+        hint = (
+            " (output was truncated at this tool's byte budget)" if truncated else ""
+        )
         raise RuntimeError(
-            f"apitrace info returned unparseable JSON: {stdout[:400]!r} / {stderr[:400]!r}"
+            f"apitrace info returned unparseable JSON{hint}: "
+            f"{stdout[:400]!r} / {stderr[:400]!r}"
         ) from exc
 
 
@@ -1258,6 +1276,11 @@ def _first_int(call: Call, names: tuple[str, ...]) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+def _is_fixed_function_source(source: str) -> bool:
+    """True for a D3D fixed-function transform-state slot (SetTransform(...))."""
+    return "settransform" in source.lower() or "d3dts_" in source.lower()
+
+
 def _eye_path_length(entries: list[dict]) -> float:
     """Total distance the eye travels along a series of tracked samples."""
     total = 0.0
@@ -1386,13 +1409,20 @@ def track_camera(
     # the write whose eye travels furthest reports motion when any of them moved.
     widths = [len(entries) for entries in frame_samples]
     max_width = max(widths, default=0)
+    # Rank by how *often* the eye moves, then by distance. Total path length
+    # alone is won by a single huge discontinuity -- a pass or mode switch --
+    # over a camera actually walking, which is the opposite of what is wanted.
     sample_ordinal = 0
-    best_distance = -1.0
+    best_key = (-1, -1.0)
     for ordinal in range(max_width):
         series = [entries[ordinal] for entries in frame_samples if len(entries) > ordinal]
-        distance = _eye_path_length(series)
-        if distance > best_distance:
-            best_distance, sample_ordinal = distance, ordinal
+        eyes = [entry["eye"] for entry in series if entry.get("eye")]
+        moving = sum(
+            1 for a, b in zip(eyes, eyes[1:]) if math.dist(a, b) > 1e-3
+        )
+        key = (moving, _eye_path_length(series))
+        if key > best_key:
+            best_key, sample_ordinal = key, ordinal
     track = [
         entries[sample_ordinal]
         for entries in frame_samples
@@ -1417,33 +1447,63 @@ def track_camera(
             "samples": proj_slot["samples"],
         }
     if max_width > 1:
-        result["writes_per_frame"] = round(sum(widths) / len(widths), 1) if widths else 0
+        per_frame = round(sum(widths) / len(widths), 1) if widths else 0
+        result["writes_per_frame"] = per_frame
         result["sample_ordinal"] = sample_ordinal
+        # A fixed-function transform state set several times per frame is the
+        # engine drawing separate passes (world, sky, UI), not a per-draw
+        # world*view*projection -- calling it the latter, as this note once did
+        # for a SetTransform(D3DTS_VIEW) slot, misdescribes what the caller is
+        # looking at.
+        if _is_fixed_function_source(chosen["source"]):
+            what = (
+                "the same transform state is set ~%s times per frame, which for a "
+                "fixed-function engine means separate render passes (world, sky, "
+                "UI) rather than per-object matrices" % per_frame
+            )
+        else:
+            what = (
+                "this slot is written ~%s times per frame, so it is a per-draw "
+                "world*view*projection rather than a dedicated camera constant; "
+                "each write expresses the eye in that object's space" % per_frame
+            )
         result["multi_write_note"] = (
-            f"this slot is written ~{result['writes_per_frame']} times per frame, so it "
-            "is a per-draw world*view*projection rather than a dedicated camera "
-            "constant; each write expresses the eye in that object's space. The "
-            f"trajectory follows write #{sample_ordinal}, the one whose eye travels "
-            "furthest -- other writes track other objects."
+            f"{what}. The trajectory follows write #{sample_ordinal}, the one whose "
+            "eye travels furthest -- the other writes follow other passes/objects."
         )
 
     eye_track = [entry for entry in track if "eye" in entry]
     if len(eye_track) >= 2:
-        moved = any(
-            any(abs(a - b) > 1e-3 for a, b in zip(eye_track[0]["eye"], entry["eye"]))
-            for entry in eye_track[1:]
-        )
-        result["camera_moves"] = moved
+        steps = [
+            math.dist(a["eye"], b["eye"]) for a, b in zip(eye_track, eye_track[1:])
+        ]
+        moving = sum(1 for step in steps if step > 1e-3)
+        # Sustained travel, not "differs from frame 0". A slot that jumps once
+        # between two otherwise-static values -- Morrowind's view matrix flips
+        # once between its UI and world pass, then never moves -- is not a
+        # camera in motion, and reporting it as one sends the caller chasing a
+        # slot that cannot give them a trajectory.
+        result["moving_transitions"] = moving
+        result["frame_transitions"] = len(steps)
+        # A quarter of transitions must show travel, but never demand more
+        # than the series can supply -- a two-frame track has one transition.
+        threshold = max(1, math.ceil(len(steps) * 0.25))
+        result["camera_moves"] = moving >= threshold
         result["eye_path_length"] = round(_eye_path_length(track), 4)
-        if not moved:
-            result["note"] = (
-                "eye is static across every write of this slot -- either nothing moved "
-                "during the capture, or this slot is a model matrix rather than the view"
-                if max_width > 1
-                else "eye is static across the captured frames -- either the player did "
-                "not move during capture, or this slot is a model matrix rather than "
-                "the view"
-            )
+        if not result["camera_moves"]:
+            if moving:
+                result["note"] = (
+                    f"the eye changed on only {moving} of {len(steps)} frame "
+                    "transitions and was otherwise static -- that is a pass or mode "
+                    "switch, not a camera travelling. Look for the slot the engine "
+                    "updates every frame (in a fixed-function engine the camera is "
+                    "often folded into the WORLD matrix instead of VIEW)."
+                )
+            else:
+                result["note"] = (
+                    "eye is static across every write of this slot -- either nothing "
+                    "moved during the capture, or this slot is not the view matrix"
+                )
     return result
 
 

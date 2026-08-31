@@ -421,9 +421,13 @@ def _launcher_bytes(exe_name: str, trace_file: Path) -> bytes:
         "exit /b %_APITRACE_EXIT%",
         "",
     ]
-    # cmd.exe recognises a UTF-8 BOM, which preserves non-ASCII game and trace
-    # paths on current Windows while chcp makes child-process decoding explicit.
-    return "\r\n".join(lines).encode("utf-8-sig")
+    # No BOM. cmd.exe does *not* skip one at the start of a batch file -- the
+    # bytes are read as part of the first command, so "@echo off" becomes an
+    # unrecognised command and the launcher misbehaves. Verified against a real
+    # Morrowind capture: the .bat existed and its text was correct, but it would
+    # not run. `chcp 65001` earns its keep instead -- it switches the console to
+    # UTF-8 before any path-bearing line is read, which is what non-ASCII needs.
+    return "\r\n".join(lines).encode("utf-8")
 
 
 def _install(

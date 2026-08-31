@@ -97,6 +97,21 @@ class WrapperFixTests(unittest.TestCase):
         self.assertFalse((self.game / wrappers.LOCK_NAME).exists())
         self.assertEqual(target.read_bytes(), b"original-shim")
 
+    def test_launcher_has_no_bom_and_starts_with_echo_off(self) -> None:
+        # cmd.exe does not skip a UTF-8 BOM in a batch file: the bytes join the
+        # first command, so "@echo off" is never recognised. A real Morrowind
+        # capture failed to launch on exactly this -- the file was present and
+        # its text read correctly, but the batch would not run.
+        trace = Path("D:/traces/mw.trace")
+        payload = wrappers._launcher_bytes("Morrowind.exe", trace)
+        self.assertFalse(
+            payload.startswith(bytes([0xEF, 0xBB, 0xBF])), "launcher carries a BOM"
+        )
+        self.assertTrue(payload.startswith(b"@echo off" + bytes([13, 10])))
+        self.assertIn(b"chcp 65001", payload)
+        text = payload.decode("utf-8")
+        self.assertIn(str(trace), text)
+
 
 if __name__ == "__main__":
     unittest.main()

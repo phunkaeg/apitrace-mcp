@@ -58,8 +58,12 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(manifest["files"][0]["installed_sha256"], sha256(target))
         self.assertEqual(manifest["files"][0]["original_sha256"], sha256(backup))
         launcher_bytes = launcher.read_bytes()
-        self.assertTrue(launcher_bytes.startswith(b"\xef\xbb\xbf"))
-        launcher_text = launcher_bytes.decode("utf-8-sig")
+        # No BOM: cmd.exe reads it as part of the first command, which stops
+        # "@echo off" being recognised and breaks the launcher. This assertion
+        # previously demanded the opposite and locked in that bug.
+        self.assertFalse(launcher_bytes.startswith(b"\xef\xbb\xbf"))
+        self.assertTrue(launcher_bytes.startswith(b"@echo off"))
+        launcher_text = launcher_bytes.decode("utf-8")
         self.assertIn('pushd "%~dp0"', launcher_text)
         self.assertIn("100%% run.trace", launcher_text)
         self.assertIn('if exist "%TRACE_FILE%"', launcher_text)
